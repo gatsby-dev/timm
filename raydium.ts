@@ -1,5 +1,5 @@
 import { Connection, PublicKey, Keypair, SlotInfo } from '@solana/web3.js';
-import { getMint } from '@solana/spl-token';
+import { getParsedTokenAccountsByOwner, getMint } from '@solana/spl-token';
 import fs from 'fs/promises';
 import dgram from 'dgram';
 import path from 'path';
@@ -30,11 +30,15 @@ fetchSolUsdPrice();
 const ENABLE_TPU_SEND = process.env.ENABLE_TPU_SEND === 'true';
 
 const TTL = (key: string, fallback: number) => parseInt(process.env[key] || `${fallback}`);
-const CACHE_TTL_SIMULATE_JUPITER = TTL('CACHE_TTL_SIMULATE_JUPITER', 30);
-const CACHE_TTL_TOKEN_METADATA = TTL('CACHE_TTL_TOKEN_METADATA', 1000);
-const CACHE_TTL_ACCOUNT_INFO = TTL('CACHE_TTL_ACCOUNT_INFO', 400);
+const CACHE_TTL_SIMULATE_JUPITER = TTL('CACHE_TTL_SIMULATE_JUPITER', 2);
+const CACHE_TTL_TOKEN_METADATA = TTL('CACHE_TTL_TOKEN_METADATA', 60);
+const CACHE_TTL_ACCOUNT_INFO = TTL('CACHE_TTL_ACCOUNT_INFO', 20);
+const BLOCKHASH_CACHE_TTL_MS = 500;
 
 const simulateCache = new Map<string, { timestamp: number, result: any }>();
+const tokenMetadataCache = createCache<any>();
+const accountInfoCache = createCache<any>();
+const blockhashCache = createCache<string>();
 
 const createCache = <T>() => {
   const store = new Map<string, { value: T; timestamp: number }>();
@@ -51,26 +55,21 @@ const createCache = <T>() => {
   };
 };
 
-const tokenMetadataCache = createCache<any>();
-const accountInfoCache = createCache<any>();
-const blockhashCache = createCache<string>();
-
 // === CONFIG ===
 const RAYDIUM_AMM_PROGRAM_ID = new PublicKey('RVKd61ztZW9MqhpFz2B5C7G5kHk9wP5oR9a4UxJR6cm');
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8899';
 const WEBSOCKET_URL = process.env.WS_URL || 'ws://127.0.0.1:8900';
 const connection = new Connection(RPC_URL, {
   wsEndpoint: WEBSOCKET_URL,
-  commitment: 'processed',
+  commitment: 'confirmed',
   disableRetryOnRateLimit: true,
 });
 const baseToken = 'So11111111111111111111111111111111111111112'; // WSOL
 const minLiquidityUSD = 6000;
-const desiredProfitPercent = parseFloat(process.env.DESIRED_PROFIT_PERCENT || '3');
-const HOLD_FOR_PROFIT = process.env.HOLD_FOR_PROFIT === 'true';
-const TRAILING_STOP_LOSS_PERCENT = parseFloat(process.env.TRAILING_STOP_LOSS_PERCENT || '0');
-
 const wallet = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY || ''));
+const walletPublicKey = new PublicKey(wallet.publicKey);
+const MIN_WSOL_BALANCE_SOL = parseFloat(process.env.MIN_WSOL_BALANCE_SOL || '0.001');
+const DESIRED_PROFIT_PERCENT = parseFloat(process.env.DESIRED_PROFIT_PERCENT || '3');
 
 const uniquePools = new Set<string>();
 const freezeCache = new Map<string, boolean>();
@@ -126,52 +125,73 @@ async function isNonFreezable(mintAddress: string): Promise<boolean> {
     return false;
   }
 }
-  }
-}
 
-async function simulateBuySell(mintBuy: string, mintSell: string) {
-  const cacheKey = `${mintBuy}_${mintSell}`;
+async function simulateBuySell(mintBuy: string, mintSell: string, simulateSellBack: boolean = false) {
+  const cacheKey = `${mintBuy}_${mintSell}${simulateSellBack ? `_${baseToken}` : ''}`;
   const cached = simulateCache.get(cacheKey);
   const now = Date.now();
   if (cached && now - cached.timestamp < CACHE_TTL_SIMULATE_JUPITER * 1000) {
     return cached.result;
   }
   const SOL_USD = liveSolUsd;
-  const routes = await jupiter.computeRoutes({
+  const inputAmount = Math.floor((parseFloat(process.env.QUOTE_AMOUNT || '0.01') * 1_000_000_000));
+
+  const routesBuy = await jupiter.computeRoutes({
     inputMint: new PublicKey(mintBuy),
     outputMint: new PublicKey(mintSell),
-    amount: Math.floor((parseFloat(process.env.QUOTE_AMOUNT || '0.01') * 1_000_000_000)),
+    amount: inputAmount,
     slippage: 1,
     forceFetch: true,
   });
 
-  const route = routes.routes?.[0] as RouteInfo;
-  if (!route) return null;
+  const routeBuy = routesBuy.routes?.[0] as RouteInfo;
+  if (!routeBuy) return null;
 
-  const output = route.outAmount / Math.pow(10, 9);
-  const input = route.inAmount / Math.pow(10, 9);
-  const profitPercent = ((output - input) / input) * 100;
+  const outputAmountBuy = routeBuy.outAmount;
+  const inputAmountSolBuy = routeBuy.inAmount;
+  const profitPercentBuy = ((outputAmountBuy - inputAmountSolBuy) / inputAmountSolBuy) * 100;
+  const profitUSDBuy = (outputAmountBuy - inputAmountSolBuy) / Math.pow(10, 9) * SOL_USD;
 
-  const profitUSD = (output - input) * SOL_USD;
-  const result = { route, profitPercent, input, output, profitUSD };
-  simulateCache.set(cacheKey, { timestamp: now, result });
-  return result;
-}
+  if (simulateSellBack) {
+    const routesSell = await jupiter.computeRoutes({
+      inputMint: new PublicKey(mintSell),
+      outputMint: new PublicKey(baseToken),
+      amount: outputAmountBuy,
+      slippage: 1,
+      forceFetch: true,
+    });
 
-function estimateLiquidity(data: Buffer): number {
-  try {
-    const reserveA = Number(data.readBigUInt64LE(136));
-    const reserveB = Number(data.readBigUInt64LE(144));
-    const liquidity = (reserveA + reserveB) / Math.pow(10, 9);
-    return liquidity;
-  } catch {
-    return 0;
+    const routeSell = routesSell.routes?.[0] as RouteInfo;
+    if (!routeSell) return null;
+
+    const outputAmountSell = routeSell.outAmount;
+    const inputAmountSell = routeSell.inAmount;
+    const netProfitSol = outputAmountSell - inputAmount;
+    const netProfitPercent = (netProfitSol / inputAmount) * 100;
+    const netProfitUSD = netProfitSol / Math.pow(10, 9) * SOL_USD;
+
+    const result = { routeBuy, routeSell, profitPercentBuy, profitUSDBuy, outputAmountBuy, inputAmountSolBuy, outputAmountSell, inputAmountSell, netProfitSol, netProfitPercent, netProfitUSD };
+    simulateCache.set(cacheKey, { timestamp: now, result });
+    return result;
+  } else {
+    const result = { routeBuy, profitPercentBuy, profitUSDBuy, outputAmountBuy, inputAmountSolBuy };
+    simulateCache.set(cacheKey, { timestamp: now, result });
+    return result;
   }
 }
 
-async function buyAndSell(route: RouteInfo, profit: number, profitUSD: number) {
+async function buyAndSell(route: RouteInfo, profitSol: number, profitUSD: number) {
   try {
     const before = Date.now();
+    const latestBlockhash = blockhashCache.get('latest', BLOCKHASH_CACHE_TTL_MS);
+    if (!latestBlockhash) {
+      console.warn(`[${timestamp()}] ⚠️ Could not retrieve latest blockhash from cache. Falling back to live fetch.`);
+      const fetchedBlockhash = await connection.getLatestBlockhash('finalized');
+      txBuilder.recentBlockhash = fetchedBlockhash.blockhash;
+    } else {
+      txBuilder.recentBlockhash = latestBlockhash;
+    }
+
     const txBuilder = await jupiter.exchange({ route, userPublicKey: wallet.publicKey });
     const signed = await txBuilder.prepare({ signers: [wallet] });
     const serialized = signed.serialize();
@@ -202,66 +222,154 @@ async function buyAndSell(route: RouteInfo, profit: number, profitUSD: number) {
     if (rpcJson.error) throw new Error(JSON.stringify(rpcJson.error));
     txid = rpcJson.result;
 
-    // Optional TPU send
-    if (ENABLE_TPU_SEND && currentLeader) {
+    // Optional External TPU Send (Now Prioritizing Local)
+    const enableExternalTpu = process.env.ENABLE_EXTERNAL_TPU === 'true';
+    const primaryTpuEndpoint = process.env.PRIMARY_TPU_ENDPOINT;
+
+    if (enableExternalTpu && primaryTpuEndpoint) {
+      const socket = dgram.createSocket('udp4');
+      socket.send(serialized, 0, serialized.length, 8001, primaryTpuEndpoint.split(':')[0], (err) => {
+        console.log(`[${timestamp()}]  Attempted send to primary TPU: ${primaryTpuEndpoint}:8001`);
+        if (err) console.warn(`[${timestamp()}] ⚠️ Failed to send to primary TPU: ${err}`);
+        socket.close();
+        if (process.env.SECONDARY_TPU_ENDPOINT && err) {
+          const retrySocket = dgram.createSocket('udp4');
+          retrySocket.send(serialized, 0, serialized.length, 8001, process.env.SECONDARY_TPU_ENDPOINT.split(':')[0], (retryErr) => {
+            console.log(`[${timestamp()}]  Attempted send to secondary TPU: ${process.env.SECONDARY_TPU_ENDPOINT}:8001`);
+            if (retryErr) console.warn(`[${timestamp()}] ⚠️ Failed to send to secondary TPU: ${retryErr}`);
+            retrySocket.close();
+          });
+        }
+      });
+    } else if (ENABLE_TPU_SEND && currentLeader) { // Fallback to leader-derived if external not enabled
       const tpuAddress = `${currentLeader}`.replace('http://', '').replace('https://', '').split(':')[0];
       const socket = dgram.createSocket('udp4');
       socket.send(serialized, 0, serialized.length, 8001, tpuAddress, (err) => {
-        // Log successful TPU send attempt
-        console.log(`[${timestamp()}]  Sent to TPU: ${tpuAddress}:8001`);
-        console.log(`[${timestamp()}]  Sent to TPU: ${tpuAddress}:8003`);
-        if (err) console.warn(`[${timestamp()}] ⚠️ Failed to send to TPU:`, err);
+        console.log(`[${timestamp()}]  Attempted send to leader TPU: ${tpuAddress}:8001`);
+        if (err) console.warn(`[${timestamp()}] ⚠️ Failed to send to leader TPU: ${err}`);
         socket.close();
       });
     }
 
     const after = Date.now();
     const latencyMs = after - before;
-    totalProfit += profit;
+    totalProfit += profitSol;
     successfulTrades++;
 
     const tokenPair = `${route.marketInfo.inputMint.toBase58()} -> ${route.marketInfo.outputMint.toBase58()}`;
-    console.log(`[${timestamp()}] ✅ Buy+Sell executed in same block! Tx: ${txid}`);
-    console.log(`[${timestamp()}]  Profit: $${profitUSD.toFixed(2)} | SOL: ${(profit).toFixed(6)}`);
-    console.log(`[${timestamp()}] 燐 Win rate: ${(successfulTrades > 0 ? 100 : 0).toFixed(2)}% | Avg Profit: $${(totalProfit / successfulTrades || 0).toFixed(4)}`);
+    console.log(`[${timestamp()}] ✅ Trade executed! Tx: ${txid}`);
+    console.log(`[${timestamp()}]  Profit: $${profitUSD.toFixed(2)} | SOL: ${(profitSol).toFixed(6)}`);
+    console.log(`[${timestamp()}] 燐 Win rate: ${(successfulTrades > 0 ? 100 : 0).toFixed(2)}% | Avg Profit: $${(totalProfit / successfulTrades || 0).toFixed(4)}`);
     console.log(`[${timestamp()}] ⏱️ Execution latency: ${latencyMs}ms |  Running profit total: $${totalProfit.toFixed(2)}`);
 
-    await fs.appendFile('latency.txt', `[${timestamp()}] Tx: ${txid} | Latency: ${latencyMs}ms | Profit: $${profit.toFixed(6)} | ProfitUSD: $${profitUSD.toFixed(2)}
-`).catch(() => {});
-    await fs.appendFile('success.txt', `[${timestamp()}] SUCCESS: ${txid} | Profit: $${profitUSD.toFixed(2)} | Pair: ${tokenPair}
-`).catch(() => {});
-  } catch (err) {
+    await fs.appendFile('latency.txt', `[${timestamp()}] Tx: ${txid} | Latency: ${latencyMs}ms | Profit: $${profitSol.toFixed(6)} | ProfitUSD: $${profitUSD.toFixed(2)}\n`).catch(() => {});
+    await fs.appendFile('success.txt', `[${timestamp()}] SUCCESS: ${txid} | Profit: $${profitUSD.toFixed(2)} | Pair: ${tokenPair}\n`).catch(() => {});
+  } catch (err: any) {
     console.warn(`[${timestamp()}] ❌ Execution failed: ${err}`);
+    if (err?.message?.includes('Transaction was not confirmed in')) {
+      console.warn(`[${timestamp()}] ⚠️ Transaction confirmation timeout for txid: ${txid}`);
+      // Consider very short retry logic here if needed
+    } else if (err?.message?.includes('AccountNotFound')) {
+      console.warn(`[${timestamp()}] ⚠️ Account not found error for txid: ${txid}`);
+    } else if (err?.message?.includes('Blockhash not found')) {
+      console.warn(`[${timestamp()}] ⚠️ Blockhash not found error.`);
+      // This might indicate an issue with your blockhash caching or RPC connection
+    } else if (err?.message?.includes('failed to send transaction: SendTransactionPreflightFailure')) {
+      console.warn(`[${timestamp()}] ⚠️ Transaction preflight failure for txid: ${txid}`);
+      // This could be due to insufficient funds, invalid account state, etc.
+    }
+    // Log the full error for debugging
+    console.error(`[${timestamp()}]  Full error details:`, err);
   }
-} = await jupiter.exchange({ route, userPublicKey: wallet.publicKey });
-    const txid = await execute();
-    const after = Date.now();
-    const latencyMs = after - before;
+}
 
-    totalProfit += profit;
-    console.log(`[${timestamp()}] ✅ Buy+Sell executed in same block! Tx: ${txid}`);
-    console.log(`[${timestamp()}] ⏱️ Execution latency: ${latencyMs}ms |  Running profit total: $${totalProfit.toFixed(2)}`);
-  } catch (err) {
-    console.warn(`[${timestamp()}] ❌ Execution failed: ${err}`);
+async function checkLocalServices() {
+  console.log(`[${timestamp()}] 喙 Checking local service connectivity and wallet balance...`);
+
+  // Check Solana RPC
+  try {
+    const health = await connection.getHealth();
+    console.log(`[${timestamp()}] ✅ Solana RPC status: ${health}`);
+    if (health !== 'ok') {
+      console.warn(`[${timestamp()}] ⚠️ Solana RPC is not 'ok', bot might not function correctly.`);
+    }
+  } catch (error) {
+    console.error(`[${timestamp()}] ❌ Error connecting to Solana RPC at ${RPC_URL}:`, error);
+    process.exit(1); // Exit the bot if RPC is not available
+  }
+
+  // Check Jupiter API
+  try {
+    const response = await fetch(process.env.JUPITER_ROUTE_API || 'http://127.0.0.1:8080');
+    if (!response.ok) {
+      console.warn(`[${timestamp()}] ⚠️ Jupiter API at ${process.env.JUPITER_ROUTE_API || 'http://127.0.0.1:8080'} returned status: ${response.status} - ${response.statusText}`);
+      // Optionally decide if this is critical enough to exit
+    } else {
+      console.log(`[${timestamp()}] ✅ Jupiter API is reachable.`);
+    }
+  } catch (error) {
+    console.error(`[${timestamp()}] ❌ Error connecting to Jupiter API at ${process.env.JUPITER_ROUTE_API || 'http://127.0.0.1:8080'}:`, error);
+    // Optionally decide if this is critical enough to exit
+  }
+
+  // Check WSOL Balance
+  try {
+    const tokenAccounts = await getParsedTokenAccountsByOwner(
+      connection,
+      walletPublicKey,
+      { mint: new PublicKey(baseToken) }
+    );
+
+    let wsolBalanceSOL = 0;
+    if (tokenAccounts.value.length > 0) {
+      const accountInfo = tokenAccounts.value[0].account?.data?.parsed?.info;
+      if (accountInfo?.tokenAmount?.uiAmount !== undefined) {
+        wsolBalanceSOL = accountInfo.tokenAmount.uiAmount;
+      }
+    }
+
+    console.log(`[${timestamp()}] ✅ WSOL Balance: ${wsolBalanceSOL.toFixed(9)} SOL`);
+
+    if (wsolBalanceSOL < MIN_WSOL_BALANCE_SOL) {
+      console.warn(`[<span class="math-inline">\{timestamp\(\)\}\] ⚠️ WARNING\: WSOL balance is below the minimum threshold \(</span>{MIN_WSOL_BALANCE_SOL} SOL). Bot might not be able to execute trades.`);
+      // Optionally, you could decide to exit the bot here if the balance is too low on startup
+      // process.exit(1);
+    }
+
+  } catch (error) {
+    console.error(`[${timestamp()}] ❌ Error checking WSOL balance:`, error);
+    // Optionally handle the error, perhaps by exiting or logging a severe warning
+    // process.exit(1);
   }
 }
 
 async function main() {
-  console.log(`[${timestamp()}] ⏳ Initializing Jupiter and watching Raydium pools...`);
-  jupiter = await Jupiter.load({ connection, cluster: 'mainnet-beta', userPublicKey: wallet.publicKey, routeCacheApiUrl: process.env.JUPITER_ROUTE_API || undefined,
-});
+  // Ensure PRIVATE_KEY is set before proceeding with walletPublicKey
+  if (!process.env.PRIVATE_KEY) {
+    console.error(`[${timestamp()}] ❌ Error: PRIVATE_KEY environment variable is not set. Exiting.`);
+    process.exit(1);
+  }
 
+  await checkLocalServices();
+  console.log(`[${timestamp()}] ⏳ Initializing Jupiter and watching Raydium pools...`);
 
   connection.onSlotChange(async (slotInfo: SlotInfo) => {
-  latestSlot = slotInfo.slot;
-  try {
-    const leaders = await connection.getSlotLeaders(latestSlot, 1);
-    currentLeader = leaders[0];
-  } catch (e) {
-    console.warn(`[${timestamp()}] ⚠️ Failed to get current leader:`, e);
-    currentLeader = null;
-  }
-});
+    latestSlot = slotInfo.slot;
+    try {
+      const leaders = await connection.getSlotLeaders(latestSlot, 1);
+      currentLeader = leaders[0];
+    } catch (e) {
+      console.warn(`[${timestamp()}] ⚠️ Failed to get current leader:`, e);
+      currentLeader = null;
+    }
+
+    try {
+      const latestBlockhash = await connection.getLatestBlockhash('finalized');
+      blockhashCache.set('latest', latestBlockhash.blockhash);
+    } catch (error) {
+      console.warn(`[${timestamp()}] ⚠️ Error fetching latest blockhash:`, error);
+    }
+  });
 
   connection.onProgramAccountChange(
     RAYDIUM_AMM_PROGRAM_ID,
@@ -277,204 +385,50 @@ async function main() {
       if (!mints) return;
       const [mintA, mintB] = mints;
 
-      try {
+      const allowNonFreezableOnly = process.env.ALLOW_NON_FREEZABLE_ONLY === 'true';
+
+      if (allowNonFreezableOnly) {
         const [nonFreezableA, nonFreezableB] = await Promise.all([
           isNonFreezable(mintA),
           isNonFreezable(mintB),
         ]);
 
         if (!nonFreezableA || !nonFreezableB) {
-          console.log(`[${timestamp()}] ⛔ Skipping pool ${accountId} due to freeze authority`);
+          console.log(`[${timestamp()}] ⛔ Skipping pool ${accountId} because at least one token has freeze authority`);
           await logSkipped('freezable token', accountId, mintA, mintB, liquidity);
           return;
         }
+      }
 
-        uniquePools.add(accountId);
-        console.log(`[${timestamp()}]  New pool ${accountId} | MintA: ${mintA}, MintB: ${mintB} | Liquidity: $${liquidity}`);
+      uniquePools.add(accountId);
+      console.log(`[${timestamp()}]  New pool ${accountId} | MintA: ${mintA}, MintB: ${mintB} | Liquidity: $${liquidity}`);
 
-        const [try1, try2] = await Promise.all([
-          simulateBuySell(baseToken, mintA),
-          simulateBuySell(baseToken, mintB),
-        ]);
+      const [try1, try2] = await Promise.all([
+        simulateBuySell(baseToken, mintA, true), // Simulate round trip for Mint A
+        simulateBuySell(baseToken, mintB, true), // Simulate round trip for Mint B
+      ]);
 
-        const best = [try1, try2].filter(Boolean).sort((a, b) => b!.profitPercent - a!.profitPercent)[0];
-        if (!best || best.profitPercent < desiredProfitPercent) {
-          await logSkipped('not profitable', accountId, mintA, mintB, liquidity);
-          return;
+      const profitableTrades = [try1, try2].filter(Boolean).filter(best => best!.netProfitPercent >= DESIRED_PROFIT_PERCENT);
+      const bestImmediateRoundTrip = profitableTrades.sort((a, b) => b!.netProfitPercent - a!.netProfitPercent)[0];
+
+      if (bestImmediateRoundTrip) {
+        console.log(`[${timestamp()}] ⚡️ Profitable round trip (buy & sell) opportunity: ${bestImmediateRoundTrip.netProfitPercent.toFixed(2)}% — Slot: ${latestSlot} — Executing immediate buy and sell...`);
+        // Execute Buy
+        await buyAndSell(bestImmediateRoundTrip.routeBuy, bestImmediateRoundTrip.outputAmountBuy - bestImmediateRoundTrip.inputAmountSolBuy, bestImmediateRoundTrip.profitUSDBuy);
+        // Execute Sell Immediately After
+        if (bestImmediateRoundTrip.routeSell) {
+          await buyAndSell(bestImmediateRoundTrip.routeSell, bestImmediateRoundTrip.outputAmountSell - bestImmediateRoundTrip.inputAmountSell, bestImmediateRoundTrip.netProfitUSD);
+        } else {
+          console.warn(`[${timestamp()}] ⚠️ No sell route found for immediate sell back.`);
         }
-
-        if (HOLD_FOR_PROFIT) {
-          console.log(`[${timestamp()}] 流 HOLD mode active: not executing immediate sell. Waiting for target.`);
-
-          const entry = best.input;
-          const targetProfit = desiredProfitPercent;
-          const trailingStop = TRAILING_STOP_LOSS_PERCENT;
-
-          const heldData = JSON.stringify({
-            timestamp: timestamp(),
-            pool: accountId,
-            mintA,
-            mintB,
-            entry,
-            targetProfit,
-            trailingStop,
-            highest: best.output,
-            baseToken
-          });
-
-          await fs.appendFile('held.txt', heldData + '
-').catch(() => {});
-          await logSkipped('hold mode active', accountId, mintA, mintB, liquidity);
-          return;
-        }
-          await logSkipped('not profitable', accountId, mintA, mintB, liquidity);
-          return;
-        }
-
-        console.log(`[${timestamp()}]  Profit opportunity: ${best.profitPercent.toFixed(2)}% — Slot: ${latestSlot} — Executing...`);
-        await buyAndSell(best.route, best.output - best.input, best.profitUSD);
-      } catch (err) {
-        console.warn(`[${timestamp()}] ⚠️ Error processing pool ${accountId}: ${err}`);
-        await logSkipped('error', accountId, mintA, mintB, liquidity);
+        return;
+      } else {
+        await logSkipped('not profitable on round trip', accountId, mintA, mintB, liquidity);
+        return;
       }
     },
     'confirmed'
   );
 }
 
-import zlib from 'zlib';
-import { stat, createReadStream, createWriteStream, unlink } from 'fs';
-
-async function rotateLogsIfLarge(filePath: string) {
-  try {
-    const stats = await fs.stat(filePath);
-    if (stats.size >= 10 * 1024 * 1024) { // 10MB
-      const gzPath = `${filePath}.${Date.now()}.gz`;
-      const input = createReadStream(filePath);
-      const output = createWriteStream(gzPath);
-      const gzip = zlib.createGzip();
-      input.pipe(gzip).pipe(output);
-      output.on('finish', () => unlink(filePath, () => {}));
-    }
-  } catch {}
-}
-
-setInterval(() => {
-  rotateLogsIfLarge('success.txt');
-  rotateLogsIfLarge('latency.txt');
-  rotateLogsIfLarge(getDailyLogFile());
-}, 60_000); // check every minute
-
-async function generateHtmlSummary() {
-  const date = new Date().toISOString().slice(0, 10);
-  const successLog = await fs.readFile('success.txt', 'utf-8').catch(() => '');
-  const latencyLog = await fs.readFile('latency.txt', 'utf-8').catch(() => '');
-
-  const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><title>Raydium Bot Summary - ${date}</title></head>
-<body style="font-family:Arial,sans-serif;padding:20px;">
-  <h1>Raydium Bot Summary - ${date}</h1>
-  <h2>Summary Stats</h2>
-  <p><strong>Total Profit:</strong> $${totalProfit.toFixed(2)}</p>
-  <p><strong>Successful Trades:</strong> ${successfulTrades}</p>
-  <p><strong>Average Profit:</strong> $${(totalProfit / successfulTrades || 0).toFixed(4)}</p>
-  <hr>
-  <h2>Recent Successes</h2>
-  <pre>${successLog}</pre>
-  <h2>Latency Records</h2>
-  <pre>${latencyLog}</pre>
-</body>
-</html>`;
-
-  await fs.writeFile(`summary-${date}.html`, html);
-}
-
-setInterval(() => {
-  rotateLogsIfLarge('success.txt');
-  rotateLogsIfLarge('latency.txt');
-  rotateLogsIfLarge(getDailyLogFile());
-  generateHtmlSummary().catch(() => {});
-}, 60_000); // check every minute
-
 main().catch(console.error);
-
-// === Optional: Startup WSOL balance check and auto-wrap ===
-(async () => {
-  const AUTO_WRAP_SOL = process.env.AUTO_WRAP_SOL === 'true';
-  const AUTO_WRAP_SOL_AMOUNT = parseFloat(process.env.AUTO_WRAP_SOL_AMOUNT || '0.01');
-  const WARN_IF_NO_WSOL = process.env.WARN_IF_NO_WSOL !== 'false';
-
-  try {
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
-      mint: new PublicKey(baseToken),
-    });
-
-    const wsolAmount = tokenAccounts.value[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
-    if (wsolAmount === 0) {
-      if (AUTO_WRAP_SOL) {
-        console.log(`[${timestamp()}]  No WSOL detected, auto-wrapping 0.01 SOL...`);
-        const ix = SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: wallet.publicKey,
-          lamports: AUTO_WRAP_SOL_AMOUNT * 1e9,
-        });
-        const tx = new Transaction().add(ix);
-        tx.feePayer = wallet.publicKey;
-        tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-        const sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: true });
-        console.log(`[${timestamp()}] ✅ Sent auto-wrap transaction: ${sig}`);
-      } else if (WARN_IF_NO_WSOL) {
-        console.warn(`[${timestamp()}] ⚠️ WARNING: No WSOL detected in your wallet. Please wrap SOL before trading.`);
-      }
-    }
-  } catch (err) {
-    console.warn(`[${timestamp()}] ⚠️ WSOL balance check failed:`, err);
-  }
-})();
-
-// === Background watcher for trailing stop logic ===
-setInterval(async () => {
-  try {
-    const data = await fs.readFile('held.txt', 'utf-8').catch(() => '');
-    if (!data) return;
-    const lines = data.trim().split('
-');
-    const remaining: string[] = [];
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        const { mintA, mintB, entry: entryPrice, highest, trailingStop } = entry;
-        const [routeA, routeB] = await Promise.all([
-          simulateBuySell(baseToken, mintA),
-          simulateBuySell(baseToken, mintB)
-        ]);
-        const best = [routeA, routeB].filter(Boolean).sort((a, b) => b!.output - a!.output)[0];
-        if (!best) {
-          remaining.push(line);
-          continue;
-        }
-
-        if (best.output > highest) entry.highest = best.output;
-
-        const dropFromPeak = ((entry.highest - best.output) / entry.highest) * 100;
-        if (dropFromPeak >= trailingStop) {
-          console.log(`[${timestamp()}] ⛔ Trailing stop triggered for ${mintA}/${mintB}, drop: ${dropFromPeak.toFixed(2)}%`);
-          await buyAndSell(best.route, best.output - best.input, best.profitUSD);
-        } else {
-          remaining.push(JSON.stringify(entry));
-        }
-      } catch {
-        continue;
-      }
-    }
-
-    await fs.writeFile('held.txt', remaining.join('
-') + '
-');
-  } catch (err) {
-    console.warn(`[${timestamp()}] ⚠️ Error in trailing stop watcher:`, err);
-  }
-}, 15_000);
-
